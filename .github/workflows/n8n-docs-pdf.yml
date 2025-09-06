@@ -60,6 +60,19 @@ jobs:
           Path("n8n-docs.md").write_text(out.getvalue(), encoding="utf-8")
           print(f"Wrote n8n-docs.md with {len(order)} pages")
           PY
+      - name: Fix absolute image paths in combined MD
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import re
+          md = Path("n8n-docs.md").read_text(encoding="utf-8")
+          # Fix Markdown images: ![alt](/something/...)  ->  ![alt](n8n-docs/docs/something/...)
+          md = re.sub(r'(!\[[^\]]*\]\()/(?=[^)\s]+)', r'\1n8n-docs/docs/', md)
+          # Fix HTML images: <img src="/something/..."> -> <img src="n8n-docs/docs/something/...">
+          md = re.sub(r'(<img[^>]+src=")/([^"]+)"', r'\1n8n-docs/docs/\2"', md)
+          Path("n8n-docs.md").write_text(md, encoding="utf-8")
+          print("Patched absolute image paths -> n8n-docs/docs/…")
+          PY
 
       - name: Build PDF with Pandoc (Dockerized)
         run: |
