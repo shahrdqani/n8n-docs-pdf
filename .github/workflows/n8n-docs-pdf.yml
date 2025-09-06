@@ -1,0 +1,77 @@
+name: Build n8n documentation PDF
+on:
+  workflow_dispatch: {}
+  schedule:
+    - cron: "0 3 * * 1"  # Mondays 03:00 UTC
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout this repo
+        uses: actions/checkout@v4
+
+      - name: Clone n8n docs
+        run: |
+          git clone --depth=1 --branch main https://github.com/n8n-io/n8n-docs.git n8n-docs
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install PyYAML
+        run: python -m pip install pyyaml
+
+      - name: Combine markdown by nav.yml
+        run: |
+          python - <<'PY'
+          import sys, io
+          from pathlib import Path
+          import yaml
+          repo = Path("n8n-docs")
+          docs_dir = repo / "docs"
+          nav_file = repo / "nav.yml"
+          data = yaml.safe_load(nav_file.read_text(encoding="utf-8"))
+          nav = data.get("nav") or data
+          order = []
+          def walk(node):
+              if isinstance(node, list):
+                  for item in node: walk(item)
+              elif isinstance(node, dict):
+                  for title, value in node.items():
+                      if isinstance(value, str):
+                          p = (docs_dir / value)
+                          if not p.exists():
+                              cand = p.with_suffix(".md")
+                              if cand.exists(): p = cand
+                          if p.suffix.lower() == ".md" and p.exists():
+                              order.append((str(title), p))
+                      else:
+                          walk(value)
+          walk(nav)
+          out = io.StringIO()
+          out.write("# n8n Documentation (Unofficial PDF build)\n\n")
+          for title, path in order:
+              md = path.read_text(encoding="utf-8")
+              out.write("\n\\newpage\n\n")
+              out.write(f"# {title}\n\n")
+              out.write(md)
+          Path("n8n-docs.md").write_text(out.getvalue(), encoding="utf-8")
+          print(f"Wrote n8n-docs.md with {len(order)} pages")
+          PY
+
+      - name: Build PDF with Pandoc (Dockerized)
+        run: |
+          docker run --rm -v "${{ github.workspace }}:/data" pandoc/latex:3.1 \
+            -f gfm -t pdf --toc --toc-depth=2 \
+            -V geometry:margin=1in \
+            --resource-path="/data/n8n-docs/docs" \
+            -o /data/n8n-documentation-unofficial.pdf /data/n8n-docs.md
+
+      - name: Upload PDF artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: n8n-documentation-unofficial
+          path: n8n-documentation-unofficial.pdf
+          if-no-files-found: error
