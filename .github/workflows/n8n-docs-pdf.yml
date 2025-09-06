@@ -23,7 +23,8 @@ jobs:
       - name: Install PyYAML
         run: python -m pip install pyyaml
 
-      - name: Combine markdown by nav.yml (and rewrite resource paths)
+      # 1) ترکیب کل Markdownها طبق nav.yml و بازنویسی مسیر تصاویر/لینک‌ها
+      - name: Combine markdown by nav.yml (rewrite resource paths)
         run: |
           python - <<'PY'
           import sys, io, re
@@ -37,10 +38,9 @@ jobs:
           nav = data.get("nav") or data
 
           order = []  # [(title, path, base_rel)]
-          def walk(node, parent=""):
+          def walk(node):
               if isinstance(node, list):
-                  for item in node:
-                      walk(item, parent)
+                  for item in node: walk(item)
               elif isinstance(node, dict):
                   for title, value in node.items():
                       if isinstance(value, str):
@@ -52,11 +52,11 @@ jobs:
                               rel_base = p.parent.relative_to(docs_dir).as_posix()
                               order.append((str(title), p, rel_base))
                       else:
-                          walk(value, parent)
+                          walk(value)
           walk(nav)
 
           def rewrite_urls(text, base_rel):
-              # markdown image or link: ![alt](url) / [txt](url)
+              # ![alt](url) و [txt](url)
               def repl_md(m):
                   url = m.group(2).strip()
                   if re.match(r'^(https?:|mailto:|#|data:)', url):
@@ -66,8 +66,7 @@ jobs:
                   else:
                       new = f"n8n-docs/docs/{base_rel}/{url}"
                   return m.group(1) + new + m.group(3)
-
-              # html <img src="...">
+              # <img src="...">
               def repl_img(m):
                   url = m.group(2)
                   if re.match(r'^(https?:|data:)', url):
@@ -76,10 +75,10 @@ jobs:
                       new = f"n8n-docs/docs{url}"
                   else:
                       new = f"n8n-docs/docs/{base_rel}/{url}"
-                  return m.group(1) + new + '"'
+                  return m.group(1) + new + '\"'
 
               text = re.sub(r'(!?\[[^\]]*\]\()([^)]+)(\))', repl_md, text)
-              text = re.sub(r'(<img[^>]+src=")([^"]+)"', repl_img, text)
+              text = re.sub(r'(<img[^>]+src=\")([^\"]+)\"', repl_img, text)
               return text
 
           out = io.StringIO()
@@ -96,64 +95,22 @@ jobs:
           print(f"Wrote n8n-docs.md with {len(order)} sections")
           PY
 
-      # --- NEW: install SVG converter and convert all .svg -> .png
-      - name: Install SVG converter
+      # 2) ساخت PDF با Chromium (بدون LaTeX) — SVG کاملاً پشتیبانی می‌شود
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install md-to-pdf (Chromium renderer)
+        run: npm i -g md-to-pdf
+
+      - name: Build PDF (no LaTeX, SVG-friendly)
         run: |
-          sudo apt-get update
-          sudo apt-get install -y librsvg2-bin
-
-      - name: Convert SVGs to PNG and rewrite links
-        run: |
-          python - <<'PY'
-          import re, subprocess, shlex
-          from pathlib import Path
-
-          md_path = Path("n8n-docs.md")
-          text = md_path.read_text(encoding="utf-8")
-
-          svg_paths = sorted(set(re.findall(r'(n8n-docs/docs/[^)"]+?\\.svg)', text, flags=re.IGNORECASE)))
-          out_dir = Path("n8n-docs/docs/_converted")
-          out_dir.mkdir(parents=True, exist_ok=True)
-
-          def safe_name(p):
-              return p.replace("/", "__").replace("\\\\", "__")
-
-          converted = {}
-          for p in svg_paths:
-              src = Path(p)
-              if not src.exists():
-                  print("Skip (missing):", p)
-                  continue
-              dst = out_dir / (safe_name(p) + ".png")
-              cmd = f'rsvg-convert -o "{dst}" "{src}"'
-              try:
-                  subprocess.run(shlex.split(cmd), check=True)
-                  converted[p] = str(dst).replace("\\\\", "/")
-                  print("Converted:", p, "->", dst)
-              except subprocess.CalledProcessError as e:
-                  print("FAILED converting:", p, e)
-
-          # rewrite links
-          def repl(m):
-              p = m.group(1)
-              return converted.get(p, p)
-
-          new_text = re.sub(r'(n8n-docs/docs/[^)"]+?\\.svg)', repl, text, flags=re.IGNORECASE)
-          md_path.write_text(new_text, encoding="utf-8")
-          print("Rewrote SVG links to PNG where available.")
-          PY
-
-      - name: Build PDF with Pandoc (Dockerized)
-        run: |
-          docker run --rm -v "${{ github.workspace }}:/data" pandoc/latex:3.1 \
-            -f gfm -t pdf --toc --toc-depth=2 \
-            -V geometry:margin=1in \
-            --resource-path="/data:/data/n8n-docs/docs" \
-            -o /data/n8n-documentation-unofficial.pdf /data/n8n-docs.md
+          md-to-pdf n8n-docs.md --basedir .
 
       - name: Upload PDF artifact
         uses: actions/upload-artifact@v4
         with:
           name: n8n-documentation-unofficial
-          path: n8n-documentation-unofficial.pdf
+          path: n8n-docs.pdf
           if-no-files-found: error
