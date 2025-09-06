@@ -1,114 +1,79 @@
-name: Build n8n documentation PDF
-on:
-  workflow_dispatch: {}
-  schedule:
-    - cron: "0 3 * * 1"  # Mondays 03:00 UTC
-
-jobs:
-  build:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout this repo
-        uses: actions/checkout@v4
-
-      - name: Clone n8n docs
+      # نصب پیش‌نیازهای کرومیوم (برای اطمینان)
+      - name: Install Chromium runtime deps
         run: |
-          git clone --depth=1 --branch main https://github.com/n8n-io/n8n-docs.git n8n-docs
+          sudo apt-get update
+          sudo apt-get install -y \
+            libnss3 libxss1 libasound2 libatk-bridge2.0-0 libcups2 \
+            libx11-xcb1 libxcomposite1 libxdamage1 libxrandr2 libgbm1 \
+            libpango-1.0-0 libpangocairo-1.0-0 fonts-liberation
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
-      - name: Install PyYAML
-        run: python -m pip install pyyaml
-
-      # 1) ترکیب کل Markdownها طبق nav.yml و بازنویسی مسیر تصاویر/لینک‌ها
-      - name: Combine markdown by nav.yml (rewrite resource paths)
-        run: |
-          python - <<'PY'
-          import sys, io, re
-          from pathlib import Path
-          import yaml
-
-          repo = Path("n8n-docs")
-          docs_dir = repo / "docs"
-          nav_file = repo / "nav.yml"
-          data = yaml.safe_load(nav_file.read_text(encoding="utf-8"))
-          nav = data.get("nav") or data
-
-          order = []  # [(title, path, base_rel)]
-          def walk(node):
-              if isinstance(node, list):
-                  for item in node: walk(item)
-              elif isinstance(node, dict):
-                  for title, value in node.items():
-                      if isinstance(value, str):
-                          p = (docs_dir / value)
-                          if not p.exists():
-                              cand = p.with_suffix(".md")
-                              if cand.exists(): p = cand
-                          if p.suffix.lower() == ".md" and p.exists():
-                              rel_base = p.parent.relative_to(docs_dir).as_posix()
-                              order.append((str(title), p, rel_base))
-                      else:
-                          walk(value)
-          walk(nav)
-
-          def rewrite_urls(text, base_rel):
-              # ![alt](url) و [txt](url)
-              def repl_md(m):
-                  url = m.group(2).strip()
-                  if re.match(r'^(https?:|mailto:|#|data:)', url):
-                      return m.group(0)
-                  if url.startswith('/'):
-                      new = f"n8n-docs/docs{url}"
-                  else:
-                      new = f"n8n-docs/docs/{base_rel}/{url}"
-                  return m.group(1) + new + m.group(3)
-              # <img src="...">
-              def repl_img(m):
-                  url = m.group(2)
-                  if re.match(r'^(https?:|data:)', url):
-                      return m.group(0)
-                  if url.startswith('/'):
-                      new = f"n8n-docs/docs{url}"
-                  else:
-                      new = f"n8n-docs/docs/{base_rel}/{url}"
-                  return m.group(1) + new + '\"'
-
-              text = re.sub(r'(!?\[[^\]]*\]\()([^)]+)(\))', repl_md, text)
-              text = re.sub(r'(<img[^>]+src=\")([^\"]+)\"', repl_img, text)
-              return text
-
-          out = io.StringIO()
-          out.write("# n8n Documentation (Unofficial PDF build)\n\n")
-
-          for title, path, base_rel in order:
-              md = path.read_text(encoding="utf-8")
-              md = rewrite_urls(md, base_rel)
-              out.write("\n\\newpage\n\n")
-              out.write(f"# {title}\n\n")
-              out.write(md)
-
-          Path("n8n-docs.md").write_text(out.getvalue(), encoding="utf-8")
-          print(f"Wrote n8n-docs.md with {len(order)} sections")
-          PY
-
-      # 2) ساخت PDF با Chromium (بدون LaTeX) — SVG کاملاً پشتیبانی می‌شود
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
           node-version: '20'
 
-      - name: Install md-to-pdf (Chromium renderer)
-        run: npm i -g md-to-pdf
-
-      - name: Build PDF (no LaTeX, SVG-friendly)
+      - name: Install md-to-pdf and puppeteer
         run: |
-          md-to-pdf n8n-docs.md --basedir . \
-            --launch-options '{"args":["--no-sandbox","--disable-setuid-sandbox"]}'
+          npm i -g md-to-pdf
+          npm i puppeteer
 
+      # مرحله ۱: خروجی HTML بساز (بدون کرومیوم، سریع و پایدار)
+      - name: Generate HTML (no browser)
+        run: |
+          md-to-pdf n8n-docs.md --basedir . --as-html
+
+      # مرحله ۲: رندر HTML به PDF با Puppeteer (بدون سندباکس + بدون تایم‌اوت)
+      - name: Render HTML to PDF with Puppeteer
+        run: |
+          cat > render.js <<'JS'
+          const fs = require('fs');
+          const path = require('path');
+          const puppeteer = require('puppeteer');
+
+          (async () => {
+            const htmlPath = path.resolve('n8n-docs.html');
+            let html = fs.readFileSync(htmlPath, 'utf8');
+
+            // base برای حل مسیرهای نسبی تصاویر/استایل‌ها
+            if (!/<base\s/i.test(html)) {
+              const baseHref = 'file://' + process.cwd() + '/';
+              html = html.replace(/<head>/i, `<head><base href="${baseHref}">`);
+            }
+
+            const browser = await puppeteer.launch({
+              args: ['--no-sandbox', '--disable-setuid-sandbox'],
+              headless: 'new'
+            });
+
+            const page = await browser.newPage();
+            page.setDefaultNavigationTimeout(0);
+            page.setDefaultTimeout(0);
+
+            await page.setContent(html, { waitUntil: 'load', timeout: 0 });
+
+            // صبر تا همه تصاویر لود شوند (جلوگیری از صفحه سفید/نیمه‌کاره)
+            await page.evaluate(async () => {
+              await Promise.all(Array.from(document.images).map(img => {
+                if (img.complete) return;
+                return new Promise(res => {
+                  img.addEventListener('load', res, { once: true });
+                  img.addEventListener('error', res, { once: true });
+                });
+              }));
+            });
+
+            await page.emulateMediaType('screen');
+            await page.pdf({
+              path: 'n8n-docs.pdf',
+              format: 'A4',
+              printBackground: true,
+              margin: { top: '20mm', right: '15mm', bottom: '20mm', left: '15mm' }
+            });
+
+            await browser.close();
+          })().catch(err => { console.error(err); process.exit(1); });
+          JS
+          node render.js
 
       - name: Upload PDF artifact
         uses: actions/upload-artifact@v4
