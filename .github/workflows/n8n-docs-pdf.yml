@@ -23,21 +23,24 @@ jobs:
       - name: Install PyYAML
         run: python -m pip install pyyaml
 
-      - name: Combine markdown by nav.yml
+      - name: Combine markdown by nav.yml (and rewrite resource paths)
         run: |
           python - <<'PY'
-          import sys, io
+          import sys, io, re
           from pathlib import Path
           import yaml
+
           repo = Path("n8n-docs")
           docs_dir = repo / "docs"
           nav_file = repo / "nav.yml"
           data = yaml.safe_load(nav_file.read_text(encoding="utf-8"))
           nav = data.get("nav") or data
-          order = []
-          def walk(node):
+
+          order = []  # [(title, path, base_rel)]
+          def walk(node, parent=""):
               if isinstance(node, list):
-                  for item in node: walk(item)
+                  for item in node:
+                      walk(item, parent)
               elif isinstance(node, dict):
                   for title, value in node.items():
                       if isinstance(value, str):
@@ -46,32 +49,98 @@ jobs:
                               cand = p.with_suffix(".md")
                               if cand.exists(): p = cand
                           if p.suffix.lower() == ".md" and p.exists():
-                              order.append((str(title), p))
+                              rel_base = p.parent.relative_to(docs_dir).as_posix()
+                              order.append((str(title), p, rel_base))
                       else:
-                          walk(value)
+                          walk(value, parent)
           walk(nav)
+
+          def rewrite_urls(text, base_rel):
+              # markdown image or link: ![alt](url) / [txt](url)
+              def repl_md(m):
+                  url = m.group(2).strip()
+                  if re.match(r'^(https?:|mailto:|#|data:)', url):
+                      return m.group(0)
+                  if url.startswith('/'):
+                      new = f"n8n-docs/docs{url}"
+                  else:
+                      new = f"n8n-docs/docs/{base_rel}/{url}"
+                  return m.group(1) + new + m.group(3)
+
+              # html <img src="...">
+              def repl_img(m):
+                  url = m.group(2)
+                  if re.match(r'^(https?:|data:)', url):
+                      return m.group(0)
+                  if url.startswith('/'):
+                      new = f"n8n-docs/docs{url}"
+                  else:
+                      new = f"n8n-docs/docs/{base_rel}/{url}"
+                  return m.group(1) + new + '"'
+
+              text = re.sub(r'(!?\[[^\]]*\]\()([^)]+)(\))', repl_md, text)
+              text = re.sub(r'(<img[^>]+src=")([^"]+)"', repl_img, text)
+              return text
+
           out = io.StringIO()
           out.write("# n8n Documentation (Unofficial PDF build)\n\n")
-          for title, path in order:
+
+          for title, path, base_rel in order:
               md = path.read_text(encoding="utf-8")
+              md = rewrite_urls(md, base_rel)
               out.write("\n\\newpage\n\n")
               out.write(f"# {title}\n\n")
               out.write(md)
+
           Path("n8n-docs.md").write_text(out.getvalue(), encoding="utf-8")
-          print(f"Wrote n8n-docs.md with {len(order)} pages")
+          print(f"Wrote n8n-docs.md with {len(order)} sections")
           PY
-      - name: Fix absolute image paths in combined MD
+
+      # --- NEW: install SVG converter and convert all .svg -> .png
+      - name: Install SVG converter
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y librsvg2-bin
+
+      - name: Convert SVGs to PNG and rewrite links
         run: |
           python - <<'PY'
+          import re, subprocess, shlex
           from pathlib import Path
-          import re
-          md = Path("n8n-docs.md").read_text(encoding="utf-8")
-          # Fix Markdown images: ![alt](/something/...)  ->  ![alt](n8n-docs/docs/something/...)
-          md = re.sub(r'(!\[[^\]]*\]\()/(?=[^)\s]+)', r'\1n8n-docs/docs/', md)
-          # Fix HTML images: <img src="/something/..."> -> <img src="n8n-docs/docs/something/...">
-          md = re.sub(r'(<img[^>]+src=")/([^"]+)"', r'\1n8n-docs/docs/\2"', md)
-          Path("n8n-docs.md").write_text(md, encoding="utf-8")
-          print("Patched absolute image paths -> n8n-docs/docs/…")
+
+          md_path = Path("n8n-docs.md")
+          text = md_path.read_text(encoding="utf-8")
+
+          svg_paths = sorted(set(re.findall(r'(n8n-docs/docs/[^)"]+?\\.svg)', text, flags=re.IGNORECASE)))
+          out_dir = Path("n8n-docs/docs/_converted")
+          out_dir.mkdir(parents=True, exist_ok=True)
+
+          def safe_name(p):
+              return p.replace("/", "__").replace("\\\\", "__")
+
+          converted = {}
+          for p in svg_paths:
+              src = Path(p)
+              if not src.exists():
+                  print("Skip (missing):", p)
+                  continue
+              dst = out_dir / (safe_name(p) + ".png")
+              cmd = f'rsvg-convert -o "{dst}" "{src}"'
+              try:
+                  subprocess.run(shlex.split(cmd), check=True)
+                  converted[p] = str(dst).replace("\\\\", "/")
+                  print("Converted:", p, "->", dst)
+              except subprocess.CalledProcessError as e:
+                  print("FAILED converting:", p, e)
+
+          # rewrite links
+          def repl(m):
+              p = m.group(1)
+              return converted.get(p, p)
+
+          new_text = re.sub(r'(n8n-docs/docs/[^)"]+?\\.svg)', repl, text, flags=re.IGNORECASE)
+          md_path.write_text(new_text, encoding="utf-8")
+          print("Rewrote SVG links to PNG where available.")
           PY
 
       - name: Build PDF with Pandoc (Dockerized)
@@ -79,7 +148,7 @@ jobs:
           docker run --rm -v "${{ github.workspace }}:/data" pandoc/latex:3.1 \
             -f gfm -t pdf --toc --toc-depth=2 \
             -V geometry:margin=1in \
-            --resource-path="/data/n8n-docs/docs" \
+            --resource-path="/data:/data/n8n-docs/docs" \
             -o /data/n8n-documentation-unofficial.pdf /data/n8n-docs.md
 
       - name: Upload PDF artifact
